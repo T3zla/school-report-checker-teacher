@@ -5,11 +5,7 @@ import re
 import pandas as pd
 
 from src.models import Issue, ReportCheckResult
-from src.parsers import (
-    extract_report_header_fields,
-    normalize_name,
-    normalize_pronoun,
-)
+from src.parsers import normalize_name, normalize_pronoun
 
 
 KNOWN_HEADINGS = [
@@ -21,84 +17,79 @@ KNOWN_HEADINGS = [
     "Understanding the World",
     "Expressive Arts and Design",
     "Mandarin",
-    "The following goals have been set",
+    "Summary",
 ]
 
 
-def find_matching_child(header: dict, class_df: pd.DataFrame):
-    full_name_norm = normalize_name(header["full_name_in_report"])
-    report_name_norm = normalize_name(header["report_name_in_report"])
-    dob = header["dob_in_report"]
-
-    if full_name_norm:
-        matches = class_df[class_df["name_norm"] == full_name_norm]
-        if len(matches) == 1:
-            return matches.iloc[0]
-
-    if report_name_norm and pd.notna(dob):
-        matches = class_df[
-            (class_df["report_name_norm"] == report_name_norm)
-            & (class_df["Date of Birth"] == dob)
-        ]
-        if len(matches) == 1:
-            return matches.iloc[0]
-
-    if report_name_norm:
-        matches = class_df[class_df["report_name_norm"] == report_name_norm]
-        if len(matches) == 1:
-            return matches.iloc[0]
-
-    if pd.notna(dob):
-        matches = class_df[class_df["Date of Birth"] == dob]
-        if len(matches) == 1:
-            return matches.iloc[0]
-
-    return None
-
-
 def find_nearest_heading(text: str, position: int) -> str:
-    """
-    Find the closest known heading above the given text position.
-    """
     text_before = text[:position]
     lines = text_before.splitlines()
 
     for line in reversed(lines):
         clean_line = line.strip()
+
         if not clean_line:
             continue
 
         for heading in KNOWN_HEADINGS:
             if heading.lower() in clean_line.lower():
-                if heading == "The following goals have been set":
-                    return "Goals section"
                 return f"{heading} section"
 
-    return "Narrative paragraph"
+    return "Body of report — section not detected"
 
 
-def detect_pronoun_mismatch(report_text: str, expected_pronoun: str):
+def get_sentence_around_position(text: str, position: int) -> str:
+    start = max(
+        text.rfind(".", 0, position),
+        text.rfind("!", 0, position),
+        text.rfind("?", 0, position),
+        text.rfind("\n", 0, position),
+    )
+
+    end_candidates = [
+        text.find(".", position),
+        text.find("!", position),
+        text.find("?", position),
+        text.find("\n", position),
+    ]
+    end_candidates = [idx for idx in end_candidates if idx != -1]
+
+    end = min(end_candidates) if end_candidates else len(text)
+
+    return text[start + 1 : end + 1].strip()
+
+
+def detect_pronoun_mismatch(report_text: str, expected_pronoun: str) -> list[dict]:
+    expected_pronoun = normalize_pronoun(expected_pronoun)
+
+    if not expected_pronoun:
+        return []
+
     text = report_text.lower()
 
     wrong_sets = {
         "he": [r"\bshe\b", r"\bher\b", r"\bhers\b"],
         "she": [r"\bhe\b", r"\bhim\b", r"\bhis\b"],
-        "they": [r"\bhe\b", r"\bhim\b", r"\bhis\b", r"\bshe\b", r"\bher\b", r"\bhers\b"],
+        "they": [
+            r"\bhe\b",
+            r"\bhim\b",
+            r"\bhis\b",
+            r"\bshe\b",
+            r"\bher\b",
+            r"\bhers\b",
+        ],
     }
 
-    patterns = wrong_sets.get(expected_pronoun, [])
     hits = []
 
-    for pattern in patterns:
+    for pattern in wrong_sets.get(expected_pronoun, []):
         for match in re.finditer(pattern, text):
-            start = max(match.start() - 50, 0)
-            end = min(match.end() + 80, len(report_text))
-            snippet = report_text[start:end]
+            sentence = get_sentence_around_position(report_text, match.start())
             location_hint = find_nearest_heading(report_text, match.start())
 
             hits.append(
                 {
-                    "snippet": snippet,
+                    "snippet": sentence,
                     "location_hint": location_hint,
                 }
             )
@@ -106,163 +97,196 @@ def detect_pronoun_mismatch(report_text: str, expected_pronoun: str):
     return hits
 
 
-def detect_copy_paste_names(report_text: str, matched_row: pd.Series, class_df: pd.DataFrame):
+def detect_wrong_names(
+    report_text: str,
+    expected_names: list[str],
+    all_names: list[str],
+) -> list[dict]:
     text = report_text.lower()
-    matched_full = str(matched_row["Name"])
-    matched_report = str(matched_row["Report Name"]).lower()
-
+    expected_norms = {normalize_name(name) for name in expected_names if name}
     hits = []
+
+    for name in all_names:
+        if not name:
+            continue
+
+        name_norm = normalize_name(name)
+
+        if not name_norm:
+            continue
+
+        if name_norm in expected_norms:
+            continue
+
+        match = re.search(rf"\b{re.escape(name.lower())}\b", text)
+
+        if match:
+            hits.append(
+                {
+                    "name": name,
+                    "location_hint": find_nearest_heading(report_text, match.start()),
+                    "snippet": get_sentence_around_position(report_text, match.start()),
+                }
+            )
+
+    return hits
+
+
+def detect_expected_name_missing(report_text: str, expected_name: str) -> bool:
+    if not expected_name:
+        return False
+
+    expected_parts = normalize_name(expected_name).split()
+
+    if not expected_parts:
+        return False
+
+    text_norm = normalize_name(report_text)
+
+    return not any(part in text_norm for part in expected_parts)
+
+
+def find_matching_row(report_file_name: str, report_text: str, class_df: pd.DataFrame):
+    if len(class_df) == 1:
+        return class_df.iloc[0]
+
+    file_and_text = f"{report_file_name}\n{report_text}".lower()
+
+    # 1. Prefer full-name matches first.
+    # This helps with duplicate report names like "Isabelle".
+    for _, row in class_df.iterrows():
+        full_name = str(row.get("Name", "")).strip()
+
+        if full_name and full_name.lower() in file_and_text:
+            return row
+
+    # 2. Then try unique report names only.
+    report_name_counts = (
+        class_df["Report Name"]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .value_counts()
+        .to_dict()
+    )
 
     for _, row in class_df.iterrows():
-        other_full = str(row["Name"])
-        other_report = str(row["Report Name"])
+        report_name = str(row.get("Report Name", "")).strip()
+        report_name_key = report_name.lower()
 
-        if other_full == matched_full:
+        if not report_name:
             continue
 
-        if other_report.lower() == matched_report:
+        if report_name_counts.get(report_name_key, 0) != 1:
             continue
 
-        match = re.search(rf"\b{re.escape(other_report.lower())}\b", text)
-        if other_report and match:
-            location_hint = find_nearest_heading(report_text, match.start())
-            hits.append(
-                {
-                    "name": other_report,
-                    "location_hint": location_hint,
-                }
-            )
+        if report_name_key in file_and_text:
+            return row
 
-    return hits
+    return None
+
+
+def collect_all_possible_names(class_df: pd.DataFrame) -> list[str]:
+    names = []
+
+    for _, row in class_df.iterrows():
+        full_name = str(row.get("Name", "")).strip()
+        report_name = str(row.get("Report Name", "")).strip()
+
+        if full_name:
+            names.append(full_name)
+
+        if report_name:
+            names.append(report_name)
+
+    return sorted(set(names))
 
 
 def deduplicate_issues(issues: list[Issue]) -> list[Issue]:
-    """
-    Collapse identical issues so the teacher-facing output is cleaner.
-    """
-    grouped: dict[tuple[str, str | None], list[Issue]] = {}
+    grouped: dict[tuple[str, str | None, str], Issue] = {}
 
     for issue in issues:
-        key = (issue.issue_type, issue.location_hint)
-        grouped.setdefault(key, []).append(issue)
+        key = (issue.issue_type, issue.location_hint, issue.snippet)
+        grouped.setdefault(key, issue)
 
-    deduped: list[Issue] = []
-
-    for (issue_type, location_hint), group in grouped.items():
-        if issue_type == "pronoun_mismatch" and len(group) > 1:
-            deduped.append(
-                Issue(
-                    issue_type="pronoun_mismatch",
-                    severity="high",
-                    snippet=group[0].snippet,
-                    explanation=f"Multiple pronoun inconsistencies were found.",
-                    suggested_check="Check the child's pronouns carefully in this section.",
-                    location_hint=location_hint,
-                )
-            )
-        else:
-            deduped.extend(group)
-
-    return deduped
+    return list(grouped.values())
 
 
-def check_report(report_file_name: str, report_text: str, class_df: pd.DataFrame) -> ReportCheckResult:
-    header = extract_report_header_fields(report_text)
+def check_report(
+    report_file_name: str,
+    report_text: str,
+    class_df: pd.DataFrame,
+) -> ReportCheckResult:
+    result = ReportCheckResult(report_file=report_file_name)
 
-    result = ReportCheckResult(
-        report_file=report_file_name,
-        student_raw=header["student_raw"],
-        detected_full_name=header["full_name_in_report"],
-        detected_report_name=header["report_name_in_report"],
-    )
-
-    if not header["student_raw"]:
-        result.issues.append(
-            Issue(
-                issue_type="missing_reference_field",
-                severity="high",
-                explanation="Could not find the student name in the report header.",
-                suggested_check="Check that the report contains a Student field in the header.",
-                location_hint="Student header",
-            )
-        )
-
-    if pd.isna(header["dob_in_report"]):
-        result.issues.append(
-            Issue(
-                issue_type="missing_reference_field",
-                severity="high",
-                explanation="Could not read a valid date of birth from the report header.",
-                suggested_check="Check the date of birth in the header.",
-                location_hint="Student header",
-            )
-        )
-
-    matched_row = find_matching_child(header, class_df)
+    matched_row = find_matching_row(report_file_name, report_text, class_df)
 
     if matched_row is None:
         result.issues.append(
             Issue(
                 issue_type="human_check_needed",
                 severity="high",
-                explanation="The report could not be matched confidently to the class list.",
-                suggested_check="Check the student name, report name, and date of birth manually.",
-                location_hint="Student header",
+                explanation="Could not confidently match this report to a student.",
+                suggested_check="Check the file name or student name manually.",
+                location_hint="File name or report text",
             )
         )
         result.overall_status = "human_review_needed"
-        result.teacher_summary = ""
         return result
 
-    result.matched_child_name = str(matched_row["Name"])
-    result.matched_report_name = str(matched_row["Report Name"])
+    expected_full_name = str(matched_row.get("Name", "")).strip()
+    expected_report_name = str(matched_row.get("Report Name", "")).strip()
+    expected_pronoun = str(matched_row.get("Pronoun", "")).strip()
 
-    if header["report_name_in_report"]:
-        expected_report_name = str(matched_row["Report Name"])
-        if normalize_name(header["report_name_in_report"]) != normalize_name(expected_report_name):
-            result.issues.append(
-                Issue(
-                    issue_type="name_mismatch",
-                    severity="high",
-                    snippet=header["student_raw"],
-                    explanation=(
-                        f"The report name '{header['report_name_in_report']}' does not match "
-                        f"the class list name '{expected_report_name}'."
-                    ),
-                    suggested_check="Check the child name in the report header.",
-                    location_hint="Student header",
-                )
-            )
-    else:
+    result.matched_child_name = expected_full_name or expected_report_name
+    result.matched_report_name = expected_report_name
+    result.detected_full_name = expected_full_name
+    result.detected_report_name = expected_report_name
+
+    expected_name_for_check = expected_report_name or expected_full_name
+
+    if expected_name_for_check and detect_expected_name_missing(
+        report_text,
+        expected_name_for_check,
+    ):
         result.issues.append(
             Issue(
-                issue_type="missing_reference_field",
+                issue_type="name_mismatch",
                 severity="medium",
-                explanation="No report name in brackets was found in the student header.",
-                suggested_check="Check the student line in the header.",
-                location_hint="Student header",
+                explanation=(
+                    f"The expected student name '{expected_name_for_check}' "
+                    "was not clearly found in the report."
+                ),
+                suggested_check="Check that the correct child's name appears in the report.",
+                location_hint="Whole report",
             )
         )
 
-    report_dob = header["dob_in_report"]
-    class_dob = matched_row["Date of Birth"]
+    all_possible_names = collect_all_possible_names(class_df)
 
-    if pd.notna(report_dob) and pd.notna(class_dob) and report_dob != class_dob:
+    valid_names_for_this_student = [
+        expected_full_name,
+        expected_report_name,
+    ]
+
+    wrong_name_hits = detect_wrong_names(
+        report_text=report_text,
+        expected_names=valid_names_for_this_student,
+        all_names=all_possible_names,
+    )
+
+    for hit in wrong_name_hits:
         result.issues.append(
             Issue(
-                issue_type="birthday_mismatch",
+                issue_type="copy_paste_error",
                 severity="high",
-                snippet=header["dob_in_report_raw"],
-                explanation=(
-                    f"The date of birth in the report does not match the class list "
-                    f"({class_dob.strftime('%Y-%m-%d')})."
-                ),
-                suggested_check="Check the date of birth in the report header.",
-                location_hint="Student header",
+                snippet=hit.get("snippet") or hit["name"],
+                explanation=f"Another student's name appears in this report: {hit['name']}.",
+                suggested_check="Check whether this is a copy-paste mistake.",
+                location_hint=hit["location_hint"],
             )
         )
 
-    expected_pronoun = normalize_pronoun(str(matched_row["Pronoun"]))
     pronoun_hits = detect_pronoun_mismatch(report_text, expected_pronoun)
 
     for hit in pronoun_hits:
@@ -271,34 +295,17 @@ def check_report(report_file_name: str, report_text: str, class_df: pd.DataFrame
                 issue_type="pronoun_mismatch",
                 severity="high",
                 snippet=hit["snippet"],
-                explanation=f"A pronoun in the report may not match the expected pronoun '{expected_pronoun}'.",
-                suggested_check="Check the child's pronouns in this section.",
-                location_hint=hit.get("location_hint"),
-            )
-        )
-
-    copy_paste_hits = detect_copy_paste_names(report_text, matched_row, class_df)
-    for hit in copy_paste_hits:
-        result.issues.append(
-            Issue(
-                issue_type="copy_paste_error",
-                severity="high",
-                snippet=hit["name"],
-                explanation="Another child's name appears in this report, which may indicate a copy-paste error.",
-                suggested_check="Check this section for the wrong child name.",
+                explanation=f"A pronoun may not match the expected pronoun '{expected_pronoun}'.",
+                suggested_check="Check the pronouns in this section.",
                 location_hint=hit["location_hint"],
             )
         )
 
     result.issues = deduplicate_issues(result.issues)
 
-    if any(issue.issue_type == "human_check_needed" for issue in result.issues):
-        result.overall_status = "human_review_needed"
-    elif result.issues:
+    if result.issues:
         result.overall_status = "issues_found"
     else:
         result.overall_status = "ok"
-
-    result.teacher_summary = ""
 
     return result
