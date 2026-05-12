@@ -1,48 +1,41 @@
 from __future__ import annotations
 
+import io
 import re
 import subprocess
 import tempfile
-from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
 from docx import Document
 
 
-REQUIRED_COLUMNS = ["Name", "Report Name", "Date of Birth", "Pronoun"]
-
-
-def normalize_spaces(value: str) -> str:
-    return re.sub(r"\s+", " ", str(value or "")).strip()
-
-
 def normalize_name(value: str) -> str:
-    value = normalize_spaces(value).lower()
-    value = re.sub(r"[^a-z\s]", "", value)
-    return normalize_spaces(value)
+    if value is None:
+        return ""
+
+    text = str(value).strip().lower()
+    text = re.sub(r"[^a-zA-Z\s]", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
 def normalize_pronoun(value: str) -> str:
-    value = normalize_spaces(value).lower()
-    mapping = {
-        "he": "he",
-        "him": "he",
-        "his": "he",
-        "she": "she",
-        "her": "she",
-        "hers": "she",
-        "they": "they",
-        "them": "they",
-        "their": "they",
-    }
-    return mapping.get(value, value)
+    if value is None:
+        return ""
 
+    text = str(value).strip().lower()
 
-def parse_date_flexible(value) -> pd.Timestamp | pd.NaT:
-    if pd.isna(value):
-        return pd.NaT
-    return pd.to_datetime(value, errors="coerce", dayfirst=True)
+    if text in {"he", "him", "his"}:
+        return "he"
+
+    if text in {"she", "her", "hers"}:
+        return "she"
+
+    if text in {"they", "them", "their", "theirs"}:
+        return "they"
+
+    return ""
 
 
 def read_class_list(uploaded_file) -> pd.DataFrame:
@@ -53,17 +46,25 @@ def read_class_list(uploaded_file) -> pd.DataFrame:
     elif file_name.endswith(".xlsx"):
         df = pd.read_excel(uploaded_file)
     else:
-        raise ValueError("Unsupported class list format. Use CSV or XLSX.")
+        raise ValueError("Class list must be a CSV or Excel file.")
 
-    missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
-    if missing:
-        raise ValueError(f"Missing class list columns: {missing}")
+    required_columns = ["Name", "Report Name", "Date of Birth", "Pronoun"]
 
-    df = df.copy()
-    df["Name"] = df["Name"].astype(str).map(normalize_spaces)
-    df["Report Name"] = df["Report Name"].astype(str).map(normalize_spaces)
-    df["Pronoun"] = df["Pronoun"].astype(str).map(normalize_pronoun)
-    df["Date of Birth"] = df["Date of Birth"].map(parse_date_flexible)
+    for column in required_columns:
+        if column not in df.columns:
+            df[column] = ""
+
+    df = df[required_columns].copy()
+
+    df["Name"] = df["Name"].fillna("").astype(str).str.strip()
+    df["Report Name"] = df["Report Name"].fillna("").astype(str).str.strip()
+    df["Pronoun"] = df["Pronoun"].fillna("").astype(str).str.strip().str.lower()
+
+    df["Date of Birth"] = pd.to_datetime(
+        df["Date of Birth"],
+        errors="coerce",
+        dayfirst=False,
+    )
 
     df["name_norm"] = df["Name"].map(normalize_name)
     df["report_name_norm"] = df["Report Name"].map(normalize_name)
@@ -71,83 +72,122 @@ def read_class_list(uploaded_file) -> pd.DataFrame:
     return df
 
 
-def _read_docx_bytes(file_bytes: bytes) -> str:
-    doc = Document(BytesIO(file_bytes))
-    return "\n".join(p.text for p in doc.paragraphs)
+def read_docx_file(uploaded_file) -> str:
+    file_bytes = uploaded_file.getvalue()
+    document = Document(io.BytesIO(file_bytes))
+
+    paragraphs = [paragraph.text for paragraph in document.paragraphs]
+
+    for table in document.tables:
+        for row in table.rows:
+            row_text = [cell.text for cell in row.cells]
+            paragraphs.append("\t".join(row_text))
+
+    return "\n".join(paragraphs)
 
 
-def _read_doc_bytes_via_textutil(file_bytes: bytes, original_name: str) -> str:
-    suffix = Path(original_name).suffix.lower() or ".doc"
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        input_path = tmpdir / f"input{suffix}"
-        output_path = tmpdir / "output.txt"
+def _read_doc_bytes_via_textutil(file_bytes: bytes, file_name: str) -> str | None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        input_path = Path(temp_dir) / file_name
+        output_path = Path(temp_dir) / "converted.txt"
 
         input_path.write_bytes(file_bytes)
 
-        result = subprocess.run(
-            ["textutil", "-convert", "txt", str(input_path), "-output", str(output_path)],
-            capture_output=True,
-            text=True,
-        )
-
-        if result.returncode != 0 or not output_path.exists():
-            raise ValueError(
-                f"Could not read legacy Word file '{original_name}'. "
-                f"textutil failed: {result.stderr.strip()}"
+        try:
+            subprocess.run(
+                [
+                    "textutil",
+                    "-convert",
+                    "txt",
+                    "-output",
+                    str(output_path),
+                    str(input_path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
             )
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            return None
 
-        return output_path.read_text(encoding="utf-8", errors="ignore")
+        if not output_path.exists():
+            return None
+
+        return output_path.read_text(errors="ignore")
+
+
+def _read_doc_bytes_via_libreoffice(file_bytes: bytes, file_name: str) -> str | None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        input_path = temp_path / file_name
+
+        input_path.write_bytes(file_bytes)
+
+        try:
+            subprocess.run(
+                [
+                    "libreoffice",
+                    "--headless",
+                    "--convert-to",
+                    "txt:Text",
+                    "--outdir",
+                    str(temp_path),
+                    str(input_path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except (
+            FileNotFoundError,
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+        ):
+            return None
+
+        converted_files = list(temp_path.glob("*.txt"))
+
+        if not converted_files:
+            return None
+
+        return converted_files[0].read_text(errors="ignore")
+
+
+def read_doc_file(uploaded_file) -> str:
+    file_bytes = uploaded_file.getvalue()
+    file_name = uploaded_file.name
+
+    text = _read_doc_bytes_via_textutil(file_bytes, file_name)
+
+    if text:
+        return text
+
+    text = _read_doc_bytes_via_libreoffice(file_bytes, file_name)
+
+    if text:
+        return text
+
+    raise ValueError(
+        "Could not read this .doc file. Please save it as a .docx file and upload it again."
+    )
+
+
+def read_txt_file(uploaded_file) -> str:
+    file_bytes = uploaded_file.getvalue()
+    return file_bytes.decode("utf-8", errors="ignore")
 
 
 def read_report_file(uploaded_file) -> str:
     file_name = uploaded_file.name.lower()
-    file_bytes = uploaded_file.read()
-
-    if file_name.endswith(".txt"):
-        return file_bytes.decode("utf-8", errors="ignore")
 
     if file_name.endswith(".docx"):
-        return _read_docx_bytes(file_bytes)
+        return read_docx_file(uploaded_file)
 
     if file_name.endswith(".doc"):
-        return _read_doc_bytes_via_textutil(file_bytes, uploaded_file.name)
+        return read_doc_file(uploaded_file)
 
-    raise ValueError(f"Unsupported report format: {uploaded_file.name}")
+    if file_name.endswith(".txt"):
+        return read_txt_file(uploaded_file)
 
-
-def extract_report_header_fields(report_text: str) -> dict:
-    student_match = re.search(
-        r"Student:\s*(.+?)\s+Date of Birth:",
-        report_text,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    dob_match = re.search(
-        r"Date of Birth:\s*([^\n\r]+)",
-        report_text,
-        flags=re.IGNORECASE,
-    )
-    class_match = re.search(
-        r"Class:\s*([^\n\r]+)",
-        report_text,
-        flags=re.IGNORECASE,
-    )
-
-    student_raw = normalize_spaces(student_match.group(1)) if student_match else ""
-    dob_raw = normalize_spaces(dob_match.group(1)) if dob_match else ""
-    class_raw = normalize_spaces(class_match.group(1)) if class_match else ""
-
-    nickname_match = re.search(r"\(([^)]+)\)", student_raw)
-    report_name = normalize_spaces(nickname_match.group(1)) if nickname_match else ""
-
-    full_name = normalize_spaces(re.sub(r"\s*\([^)]+\)", "", student_raw))
-
-    return {
-        "student_raw": student_raw,
-        "full_name_in_report": full_name,
-        "report_name_in_report": report_name,
-        "dob_in_report_raw": dob_raw,
-        "dob_in_report": parse_date_flexible(dob_raw),
-        "class_in_report": class_raw,
-    }
+    raise ValueError("Report must be a .doc, .docx, or .txt file.")
